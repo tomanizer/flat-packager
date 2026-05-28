@@ -14,9 +14,10 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from flat_packager.archive import ARCHIVE_KIND, ARCHIVE_VERSION, emit_json_line
+from flat_packager.archive import ARCHIVE_KIND, emit_json_line, read_json_lines
+from flat_packager.inspect import inspect_data
 from flat_packager.pack import build_archive, prepare_source
-from flat_packager.unpack import restore_archive
+from flat_packager.unpack import load_and_validate_archive, restore_archive
 
 
 def file_record(path: str, content: bytes) -> dict[str, object]:
@@ -40,9 +41,9 @@ def symlink_record(path: str, target: str) -> dict[str, object]:
     }
 
 
-def write_archive(path: Path, records: list[dict[str, object]]) -> None:
+def write_archive(path: Path, records: list[dict[str, object]], version: int = 1) -> None:
     with path.open("w", encoding="utf-8", newline="\n") as handle:
-        emit_json_line(handle, {"type": ARCHIVE_KIND, "version": ARCHIVE_VERSION})
+        emit_json_line(handle, {"type": ARCHIVE_KIND, "version": version})
         for record in records:
             emit_json_line(handle, record)
         emit_json_line(
@@ -108,6 +109,77 @@ class RoundTripTests(unittest.TestCase):
         self.assertTrue((restored / "empty-dir").is_dir())
         if symlink_created:
             self.assertEqual(os.readlink(restored / "nested" / "readme-link"), "../README.md")
+
+    def test_chunked_v2_archive_uses_chunk_records_and_round_trips(self) -> None:
+        source = self.work_dir / "source"
+        archive = self.work_dir / "repo.flat.txt"
+        restored = self.work_dir / "restored"
+        source.mkdir()
+        (source / "large-ish.txt").write_bytes(b"abcdefghij")
+
+        entries, files = build_archive(
+            root=source,
+            output_path=archive,
+            source_label=str(source),
+            tracked_only=False,
+            include_git=False,
+            exclude_patterns=[],
+            max_file_bytes=None,
+            chunk_size=4,
+        )
+
+        records = [record for _line, record in read_json_lines(archive)]
+        self.assertEqual(records[0]["version"], 2)
+        self.assertEqual(records[1]["encoding"], "base64-chunks")
+        self.assertEqual(records[1]["chunks"], 3)
+        self.assertEqual(sum(1 for record in records if record["type"] == "chunk"), 3)
+
+        restored_entries, restored_files = restore_archive(
+            archive_path=archive,
+            output_dir=restored,
+            overwrite=False,
+            verify_only=False,
+            no_symlinks=False,
+        )
+
+        self.assertEqual(restored_entries, entries)
+        self.assertEqual(restored_files, files)
+        self.assertEqual((restored / "large-ish.txt").read_bytes(), b"abcdefghij")
+
+    def test_gzip_archive_inspects_and_restores(self) -> None:
+        source = self.work_dir / "source"
+        archive = self.work_dir / "repo.flat.txt.gz"
+        restored = self.work_dir / "restored"
+        source.mkdir()
+        (source / "file.txt").write_text("compressed\n", encoding="utf-8")
+
+        build_archive(
+            root=source,
+            output_path=archive,
+            source_label=str(source),
+            tracked_only=False,
+            include_git=False,
+            exclude_patterns=[],
+            max_file_bytes=None,
+            chunk_size=3,
+            compression="gzip",
+        )
+
+        manifest = load_and_validate_archive(archive)
+        data = inspect_data(archive, manifest)
+        self.assertEqual(data["compression"], "gzip")
+        self.assertEqual(data["version"], 2)
+        self.assertEqual(data["files"], 1)
+        self.assertEqual(data["chunks"], 4)
+
+        restore_archive(
+            archive_path=archive,
+            output_dir=restored,
+            overwrite=False,
+            verify_only=False,
+            no_symlinks=False,
+        )
+        self.assertEqual((restored / "file.txt").read_text(encoding="utf-8"), "compressed\n")
 
     def test_verify_only_checks_archive_without_writing_output(self) -> None:
         source = self.work_dir / "source"

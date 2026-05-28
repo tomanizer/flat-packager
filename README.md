@@ -3,10 +3,11 @@
 Flat Packager turns a repository into one flat text archive, then rebuilds the
 original folder structure from that archive.
 
-The archive format is newline-delimited JSON. File contents are base64 encoded,
-so text files, binary files, empty directories, and symlinks survive the round
-trip. Restores validate archive paths, duplicate entries, symlink ancestry, and
-recorded SHA-256 hashes before writing file contents.
+The default archive format is newline-delimited JSON with chunked base64 file
+payloads. Text files, binary files, empty directories, and symlinks survive the
+round trip. Restores validate archive paths, duplicate entries, symlink
+ancestry, chunk ordering, and recorded SHA-256 hashes before writing file
+contents.
 
 ## Install
 
@@ -22,11 +23,13 @@ For development:
 python3 -m pip install -e ".[dev]"
 ```
 
-This installs two console commands:
+This installs four console commands:
 
 ```bash
 flat-pack --help
 flat-unpack --help
+flat-inspect --help
+flat-verify --help
 ```
 
 The repository also keeps compatibility wrappers:
@@ -75,6 +78,31 @@ flat-pack /path/to/repo repo.flat.txt --max-file-bytes 10485760
 flat-pack /path/to/repo repo.flat.txt --include-git
 ```
 
+## Format and Compression
+
+New archives use format version 2 by default. Version 2 stores each regular
+file as metadata plus one or more base64 chunk records, which keeps memory usage
+bounded while packing and restoring large files.
+
+```bash
+flat-pack /path/to/repo repo.flat.txt --chunk-size 1048576
+```
+
+To write the legacy inline format:
+
+```bash
+flat-pack /path/to/repo repo.v1.flat.txt --format-version 1
+```
+
+To gzip-compress an archive:
+
+```bash
+flat-pack /path/to/repo repo.flat.txt.gz --compress gzip
+```
+
+`--compress auto` is the default and writes gzip when the output path ends in
+`.gz`. Restore, inspect, and verify commands auto-detect gzip archives.
+
 ## Restore a Repository
 
 ```bash
@@ -97,11 +125,29 @@ Validate an archive without writing files:
 flat-unpack repo.flat.txt restored-repo --verify-only
 ```
 
+You can also validate without naming an output directory:
+
+```bash
+flat-verify repo.flat.txt
+```
+
 On systems where symlink creation is unavailable:
 
 ```bash
 flat-unpack repo.flat.txt restored-repo --no-symlinks
 ```
+
+## Inspect an Archive
+
+```bash
+flat-inspect repo.flat.txt
+flat-inspect repo.flat.txt --json
+flat-inspect repo.flat.txt --limit 20
+```
+
+Inspection validates the archive first, then reports version, compression,
+source metadata, entry counts, total file bytes, chunk count, largest files, and
+symlinks.
 
 ## Safety Model
 
@@ -115,6 +161,8 @@ The restore step rejects:
 - `..`, `.`, empty, or backslash path segments
 - duplicate archive paths
 - file or directory records nested underneath an archived symlink
+- chunk records that are missing, out of order, corrupt, or attached to the
+  wrong file
 - corrupt base64, size, or SHA-256 data
 
 Restored symlinks may still point outside the restored repository, because that
@@ -123,8 +171,10 @@ written as text files instead.
 
 ## Limitations
 
-- File contents are stored as base64 JSON fields, so very large files are
-  memory-heavy. Use `--max-file-bytes` to set a hard per-file cap.
+- File contents are base64 encoded, so archives are larger than raw file bytes.
+  Use gzip compression when archive size matters.
+- Legacy format version 1 stores each file as one JSON record and is
+  memory-heavy for large files. Version 2 is chunked and is the default.
 - Remote GitHub packing depends on local `git` and whatever authentication your
   git installation already has configured.
 - Git LFS files are captured as whatever exists in the cloned checkout. If LFS

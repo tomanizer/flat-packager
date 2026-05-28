@@ -33,6 +33,8 @@ jobs:
         run: |
           flat-pack --help
           flat-unpack --help
+          flat-inspect --help
+          flat-verify --help
 
   build:
     name: Build package

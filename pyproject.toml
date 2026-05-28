@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flat-packager"
-version = "0.2.0"
+version = "0.3.0"
 description = "Pack a repository into one flat text archive and restore it later."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -37,6 +37,8 @@ Repository = "https://github.com/tomanizer/flat-packager"
 [project.scripts]
 flat-pack = "flat_packager.pack:main"
 flat-unpack = "flat_packager.unpack:main"
+flat-inspect = "flat_packager.inspect:main"
+flat-verify = "flat_packager.verify:main"
 
 [project.optional-dependencies]
 dev = [

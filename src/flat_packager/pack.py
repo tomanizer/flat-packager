@@ -16,7 +16,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Iterator
 
-from .archive import ARCHIVE_KIND, ARCHIVE_VERSION, emit_json_line
+from .archive import (
+    ARCHIVE_KIND,
+    ARCHIVE_VERSION,
+    DEFAULT_CHUNK_SIZE,
+    emit_json_line,
+    open_archive_for_write,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -72,6 +78,24 @@ def parse_args() -> argparse.Namespace:
         "--no-shallow",
         action="store_true",
         help="Do a full clone instead of the default depth-1 clone for remote repositories.",
+    )
+    parser.add_argument(
+        "--format-version",
+        choices=("1", "2"),
+        default=str(ARCHIVE_VERSION),
+        help="Archive format version to write. Version 2 uses chunked file records.",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=DEFAULT_CHUNK_SIZE,
+        help="Chunk size in bytes for format version 2.",
+    )
+    parser.add_argument(
+        "--compress",
+        choices=("auto", "none", "gzip"),
+        default="auto",
+        help="Compress archive output. 'auto' uses gzip for .gz output paths.",
     )
     return parser.parse_args()
 
@@ -221,18 +245,23 @@ def parent_dirs_for_tracked_files(root: Path, files: Iterable[Path]) -> list[Pat
     return ordered
 
 
-def file_record(root: Path, path: Path, max_file_bytes: int | None) -> dict[str, object]:
+def symlink_record(root: Path, path: Path) -> dict[str, object]:
     rel = safe_relative_path(root, path)
     metadata = path.lstat()
     mode = stat.S_IMODE(metadata.st_mode)
 
+    return {
+        "type": "symlink",
+        "path": rel,
+        "mode": mode,
+        "target": os.readlink(path),
+    }
+
+
+def validate_regular_file(path: Path, rel: str, max_file_bytes: int | None) -> os.stat_result:
+    metadata = path.lstat()
     if stat.S_ISLNK(metadata.st_mode):
-        return {
-            "type": "symlink",
-            "path": rel,
-            "mode": mode,
-            "target": os.readlink(path),
-        }
+        raise ValueError(f"expected regular file, got symlink: {rel}")
 
     if not stat.S_ISREG(metadata.st_mode):
         raise ValueError(f"unsupported filesystem entry: {rel}")
@@ -241,6 +270,14 @@ def file_record(root: Path, path: Path, max_file_bytes: int | None) -> dict[str,
     if max_file_bytes is not None and size > max_file_bytes:
         raise ValueError(f"{rel} is {size} bytes, above --max-file-bytes")
 
+    return metadata
+
+
+def file_record_v1(root: Path, path: Path, max_file_bytes: int | None) -> dict[str, object]:
+    rel = safe_relative_path(root, path)
+    metadata = validate_regular_file(path, rel, max_file_bytes)
+    mode = stat.S_IMODE(metadata.st_mode)
+    size = metadata.st_size
     content = path.read_bytes()
     return {
         "type": "file",
@@ -251,6 +288,63 @@ def file_record(root: Path, path: Path, max_file_bytes: int | None) -> dict[str,
         "encoding": "base64",
         "content": base64.b64encode(content).decode("ascii"),
     }
+
+
+def hash_file(path: Path, chunk_size: int) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def emit_file_records_v2(
+    handle,
+    root: Path,
+    path: Path,
+    max_file_bytes: int | None,
+    chunk_size: int,
+) -> int:
+    rel = safe_relative_path(root, path)
+    metadata = validate_regular_file(path, rel, max_file_bytes)
+    mode = stat.S_IMODE(metadata.st_mode)
+    size = metadata.st_size
+    chunks = 0 if size == 0 else (size + chunk_size - 1) // chunk_size
+    digest = hash_file(path, chunk_size)
+
+    emit_json_line(
+        handle,
+        {
+            "type": "file",
+            "path": rel,
+            "mode": mode,
+            "size": size,
+            "sha256": digest,
+            "encoding": "base64-chunks",
+            "chunks": chunks,
+        },
+    )
+
+    chunk_count = 0
+    with path.open("rb") as file_handle:
+        while True:
+            chunk = file_handle.read(chunk_size)
+            if not chunk:
+                break
+            emit_json_line(
+                handle,
+                {
+                    "type": "chunk",
+                    "path": rel,
+                    "index": chunk_count,
+                    "size": len(chunk),
+                    "sha256": hashlib.sha256(chunk).hexdigest(),
+                    "content": base64.b64encode(chunk).decode("ascii"),
+                },
+            )
+            chunk_count += 1
+
+    return chunk_count
 
 
 def dir_record(root: Path, path: Path) -> dict[str, object]:
@@ -270,22 +364,37 @@ def build_archive(
     include_git: bool,
     exclude_patterns: list[str],
     max_file_bytes: int | None,
+    format_version: int = ARCHIVE_VERSION,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    compression: str = "auto",
 ) -> tuple[int, int]:
+    if format_version not in (1, 2):
+        raise ValueError(f"unsupported archive format version: {format_version}")
+    if chunk_size <= 0:
+        raise ValueError("--chunk-size must be greater than zero")
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     header = {
         "type": ARCHIVE_KIND,
-        "version": ARCHIVE_VERSION,
+        "version": format_version,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "source": source_label,
         "root_name": root.name,
         "tracked_only": tracked_only,
+        "format": "chunked-jsonl" if format_version == 2 else "inline-jsonl",
     }
+    if format_version == 2:
+        header["chunk_size"] = chunk_size
 
     entry_count = 0
     file_count = 0
+    dir_count = 0
+    symlink_count = 0
+    chunk_count = 0
+    byte_count = 0
 
-    with output_path.open("w", encoding="utf-8", newline="\n") as handle:
+    with open_archive_for_write(output_path, compression=compression) as handle:
         emit_json_line(handle, header)
 
         if tracked_only:
@@ -293,6 +402,7 @@ def build_archive(
             for directory in parent_dirs_for_tracked_files(root, files):
                 emit_json_line(handle, dir_record(root, directory))
                 entry_count += 1
+                dir_count += 1
             paths: Iterable[Path] = files
         else:
             paths = walked_paths(root, output_path.resolve(), include_git, exclude_patterns)
@@ -300,14 +410,43 @@ def build_archive(
         for path in paths:
             if path.is_dir() and not path.is_symlink():
                 record = dir_record(root, path)
+                dir_count += 1
+                emit_json_line(handle, record)
+            elif path.is_symlink():
+                record = symlink_record(root, path)
+                symlink_count += 1
+                emit_json_line(handle, record)
             else:
-                record = file_record(root, path, max_file_bytes)
-                if record["type"] == "file":
-                    file_count += 1
-            emit_json_line(handle, record)
+                if format_version == 1:
+                    record = file_record_v1(root, path, max_file_bytes)
+                    byte_count += int(record["size"])
+                    emit_json_line(handle, record)
+                else:
+                    rel = safe_relative_path(root, path)
+                    metadata = validate_regular_file(path, rel, max_file_bytes)
+                    byte_count += metadata.st_size
+                    chunk_count += emit_file_records_v2(
+                        handle,
+                        root,
+                        path,
+                        max_file_bytes,
+                        chunk_size,
+                    )
+                file_count += 1
             entry_count += 1
 
-        emit_json_line(handle, {"type": "end", "entries": entry_count, "files": file_count})
+        emit_json_line(
+            handle,
+            {
+                "type": "end",
+                "entries": entry_count,
+                "files": file_count,
+                "dirs": dir_count,
+                "symlinks": symlink_count,
+                "chunks": chunk_count,
+                "bytes": byte_count,
+            },
+        )
 
     return entry_count, file_count
 
@@ -334,6 +473,9 @@ def main() -> int:
             include_git=args.include_git,
             exclude_patterns=args.exclude,
             max_file_bytes=args.max_file_bytes,
+            format_version=int(args.format_version),
+            chunk_size=args.chunk_size,
+            compression=args.compress,
         )
     except (OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
