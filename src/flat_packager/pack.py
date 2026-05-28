@@ -59,6 +59,20 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Keep the temporary clone directory when source is a git URL.",
     )
+    parser.add_argument(
+        "--branch",
+        help="Branch or tag to clone when source is a remote git repository.",
+    )
+    parser.add_argument(
+        "--recurse-submodules",
+        action="store_true",
+        help="Clone submodules when source is a remote git repository.",
+    )
+    parser.add_argument(
+        "--no-shallow",
+        action="store_true",
+        help="Do a full clone instead of the default depth-1 clone for remote repositories.",
+    )
     return parser.parse_args()
 
 
@@ -82,9 +96,16 @@ def normalize_source(source: str) -> str:
     return source
 
 
-def prepare_source(source: str) -> tuple[Path, str | None]:
+def prepare_source(
+    source: str,
+    branch: str | None = None,
+    recurse_submodules: bool = False,
+    shallow: bool = True,
+) -> tuple[Path, str | None]:
     path = Path(source).expanduser()
     if path.exists():
+        if branch is not None:
+            raise SystemExit("--branch can only be used with remote git repositories")
         return path.resolve(), None
 
     if not looks_like_git_source(source):
@@ -93,11 +114,16 @@ def prepare_source(source: str) -> tuple[Path, str | None]:
     clone_url = normalize_source(source)
     temp_dir = tempfile.mkdtemp(prefix="repo-flat-clone-")
     clone_path = Path(temp_dir) / "repo"
+    command = ["git", "clone"]
+    if shallow:
+        command.extend(["--depth", "1"])
+    if branch is not None:
+        command.extend(["--branch", branch])
+    if recurse_submodules:
+        command.append("--recurse-submodules")
+    command.extend([clone_url, str(clone_path)])
     try:
-        subprocess.run(
-            ["git", "clone", "--depth", "1", clone_url, str(clone_path)],
-            check=True,
-        )
+        subprocess.run(command, check=True)
     except FileNotFoundError as exc:
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise SystemExit("git is required to clone remote repositories") from exc
@@ -290,7 +316,12 @@ def main() -> int:
     args = parse_args()
     temp_dir: str | None = None
     try:
-        root, temp_dir = prepare_source(args.source)
+        root, temp_dir = prepare_source(
+            args.source,
+            branch=args.branch,
+            recurse_submodules=args.recurse_submodules,
+            shallow=not args.no_shallow,
+        )
         if not root.is_dir():
             raise SystemExit(f"source is not a directory: {root}")
 

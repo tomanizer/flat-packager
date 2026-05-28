@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flat-packager"
-version = "0.1.0"
+version = "0.2.0"
 description = "Pack a repository into one flat text archive and restore it later."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -23,6 +23,8 @@ classifiers = [
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: Software Development :: Version Control :: Git",
   "Topic :: System :: Archiving",
 ]
@@ -39,12 +41,7 @@ flat-unpack = "flat_packager.unpack:main"
 [project.optional-dependencies]
 dev = [
   "build>=1.2",
-  "pytest>=8",
 ]
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-pythonpath = ["src"]

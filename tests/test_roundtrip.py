@@ -1,17 +1,58 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from flat_packager.pack import build_archive
+from flat_packager.archive import ARCHIVE_KIND, ARCHIVE_VERSION, emit_json_line
+from flat_packager.pack import build_archive, prepare_source
 from flat_packager.unpack import restore_archive
+
+
+def file_record(path: str, content: bytes) -> dict[str, object]:
+    return {
+        "type": "file",
+        "path": path,
+        "mode": 0o644,
+        "size": len(content),
+        "sha256": hashlib.sha256(content).hexdigest(),
+        "encoding": "base64",
+        "content": base64.b64encode(content).decode("ascii"),
+    }
+
+
+def symlink_record(path: str, target: str) -> dict[str, object]:
+    return {
+        "type": "symlink",
+        "path": path,
+        "mode": 0o777,
+        "target": target,
+    }
+
+
+def write_archive(path: Path, records: list[dict[str, object]]) -> None:
+    with path.open("w", encoding="utf-8", newline="\n") as handle:
+        emit_json_line(handle, {"type": ARCHIVE_KIND, "version": ARCHIVE_VERSION})
+        for record in records:
+            emit_json_line(handle, record)
+        emit_json_line(
+            handle,
+            {
+                "type": "end",
+                "entries": len(records),
+                "files": sum(1 for record in records if record["type"] == "file"),
+            },
+        )
 
 
 class RoundTripTests(unittest.TestCase):
@@ -97,6 +138,115 @@ class RoundTripTests(unittest.TestCase):
         self.assertEqual(entries, 1)
         self.assertEqual(files, 1)
         self.assertFalse(output.exists())
+
+    def test_invalid_archive_does_not_partially_restore(self) -> None:
+        archive = self.work_dir / "bad.flat.txt"
+        output = self.work_dir / "output"
+        bad_record = file_record("bad.txt", b"bad\n")
+        bad_record["sha256"] = "wrong"
+        write_archive(archive, [file_record("ok.txt", b"ok\n"), bad_record])
+
+        with self.assertRaisesRegex(ValueError, "sha256 mismatch"):
+            restore_archive(
+                archive_path=archive,
+                output_dir=output,
+                overwrite=False,
+                verify_only=False,
+                no_symlinks=False,
+            )
+
+        self.assertFalse(output.exists())
+
+    def test_invalid_archive_does_not_replace_existing_output(self) -> None:
+        archive = self.work_dir / "bad.flat.txt"
+        output = self.work_dir / "output"
+        output.mkdir()
+        (output / "keep.txt").write_text("keep\n", encoding="utf-8")
+        bad_record = file_record("bad.txt", b"bad\n")
+        bad_record["sha256"] = "wrong"
+        write_archive(archive, [bad_record])
+
+        with self.assertRaisesRegex(ValueError, "sha256 mismatch"):
+            restore_archive(
+                archive_path=archive,
+                output_dir=output,
+                overwrite=True,
+                verify_only=False,
+                no_symlinks=False,
+            )
+
+        self.assertEqual((output / "keep.txt").read_text(encoding="utf-8"), "keep\n")
+
+    def test_existing_symlink_parent_cannot_redirect_restore(self) -> None:
+        archive = self.work_dir / "archive.flat.txt"
+        output = self.work_dir / "output"
+        outside = self.work_dir / "outside"
+        output.mkdir()
+        outside.mkdir()
+        try:
+            os.symlink(outside, output / "link")
+        except OSError as exc:
+            self.skipTest(f"symlinks unavailable: {exc}")
+        write_archive(archive, [file_record("link/owned.txt", b"owned\n")])
+
+        restore_archive(
+            archive_path=archive,
+            output_dir=output,
+            overwrite=True,
+            verify_only=False,
+            no_symlinks=False,
+        )
+
+        self.assertFalse((outside / "owned.txt").exists())
+        self.assertTrue((output / "link").is_dir())
+        self.assertEqual((output / "link" / "owned.txt").read_text(encoding="utf-8"), "owned\n")
+
+    def test_archive_symlink_ancestor_is_rejected(self) -> None:
+        archive = self.work_dir / "archive.flat.txt"
+        output = self.work_dir / "output"
+        write_archive(
+            archive,
+            [
+                symlink_record("link", "/tmp"),
+                file_record("link/owned.txt", b"owned\n"),
+            ],
+        )
+
+        with self.assertRaisesRegex(ValueError, "nested under archived symlink"):
+            restore_archive(
+                archive_path=archive,
+                output_dir=output,
+                overwrite=False,
+                verify_only=False,
+                no_symlinks=False,
+            )
+
+        self.assertFalse(output.exists())
+
+    def test_remote_clone_options_are_passed_to_git(self) -> None:
+        with patch("flat_packager.pack.subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess(args=[], returncode=0)
+            _clone_path, temp_dir = prepare_source(
+                "owner/repo",
+                branch="release",
+                recurse_submodules=True,
+                shallow=False,
+            )
+
+        self.addCleanup(shutil.rmtree, temp_dir, ignore_errors=True)
+        self.assertIsNotNone(temp_dir)
+        self.assertEqual(
+            run.call_args.args[0],
+            [
+                "git",
+                "clone",
+                "--branch",
+                "release",
+                "--recurse-submodules",
+                "https://github.com/owner/repo.git",
+                str(Path(temp_dir) / "repo"),
+            ],
+        )
 
 
 if __name__ == "__main__":
